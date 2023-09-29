@@ -1,7 +1,10 @@
 import { similarity as ml_distance_similarity } from "ml-distance";
+import crypto from "crypto";
 import { VectorStore } from "./base.js";
 import { Embeddings } from "../embeddings/base.js";
 import { Document } from "../document.js";
+import { ScoreThresholdRetriever } from "../retrievers/score_threshold.js";
+import { Generation, GenerationChunk } from "../schema/index.js";
 
 /**
  * Interface representing a vector in memory. It includes the content
@@ -188,5 +191,157 @@ export class MemoryVectorStore extends VectorStore {
   ): Promise<MemoryVectorStore> {
     const instance = new this(embeddings, dbConfig);
     return instance;
+  }
+
+  async dropIndex() {
+    this.memoryVectors = [];
+  }
+}
+
+interface CacheDict {
+  [index: string]: MemoryVectorStore;
+}
+
+function hash(input: string) {
+  return crypto.createHash("md5").update(input, "utf8").digest("hex");
+}
+
+export interface MemorySemanticVectorStoreArgs extends MemoryVectorStoreArgs {
+  /**
+   * The threshold for the similarity score results.
+   * @default 0.2
+   */
+  scoreThreshold?: number;
+  /**
+   * The embeddings to use for the semantic cache.
+   */
+  embeddings: Embeddings;
+}
+
+/**
+ * Load generations from json.
+ *
+ * @param {string} generationsJson - A string of json representing a list of generations.
+ * @throws {Error} Could not decode json string to list of generations.
+ * @returns {Generation[]} A list of generations.
+ */
+function loadGenerationsFromJson(generationsJson: string): GenerationChunk[] {
+  try {
+    const results = JSON.parse(generationsJson);
+    return results.map(
+      (generationDict: {
+        text: string;
+        generationInfo?: Record<string, any>;
+      }) => {
+        if (typeof generationDict.text !== "string") {
+          throw new Error(`Invalid generation text: ${generationDict.text}`);
+        }
+        return new GenerationChunk(generationDict);
+      }
+    );
+  } catch (error) {
+    throw new Error(
+      `Could not decode json to list of generations: ${generationsJson}`
+    );
+  }
+}
+
+function dumpGenerationsToJson(generations: Generation[]): string {
+  return JSON.stringify(
+    generations.map((generation) => ({ text: generation.text }))
+  );
+}
+
+export class MemorySemanticVectorStore extends MemoryVectorStore {
+  private cacheDict: CacheDict;
+
+  private scoreThreshold: number;
+
+  constructor({
+    embeddings,
+    scoreThreshold = 0.2,
+    ...rest
+  }: MemorySemanticVectorStoreArgs) {
+    super(embeddings, rest);
+
+    this.cacheDict = {};
+    this.scoreThreshold = scoreThreshold;
+  }
+
+  private indexName(llmKey: string): string {
+    const hashedIndex = hash(llmKey);
+    return `cache:${hashedIndex}`;
+  }
+
+  private async getLlmCache(
+    llmKey: string
+  ): Promise<ScoreThresholdRetriever<MemoryVectorStore>> {
+    const indexName = this.indexName(llmKey);
+
+    const scoreThresholdOptions = {
+      minSimilarityScore: this.scoreThreshold,
+      maxK: 1,
+    };
+
+    if (indexName in this.cacheDict) {
+      return ScoreThresholdRetriever.fromVectorStore(
+        this.cacheDict[indexName],
+        scoreThresholdOptions
+      );
+    }
+
+    this.cacheDict[indexName] = await MemoryVectorStore.fromExistingIndex(
+      this.embeddings
+    );
+
+    return ScoreThresholdRetriever.fromVectorStore(
+      this.cacheDict[indexName],
+      scoreThresholdOptions
+    );
+  }
+
+  async clear(llmKey: string): Promise<void> {
+    const indexName = this.indexName(llmKey);
+
+    if (indexName in this.cacheDict) {
+      await this.cacheDict[indexName].dropIndex();
+      delete this.cacheDict[indexName];
+    }
+  }
+
+  async lookup(prompt: string, llmKey: string): Promise<Generation[] | null> {
+    const llmCache = await this.getLlmCache(llmKey);
+    const results = await llmCache.getRelevantDocuments(prompt);
+
+    let generations: Generation[] = [];
+    if (results) {
+      for (const document of results) {
+        generations = generations.concat(
+          loadGenerationsFromJson(document.metadata.return_val)
+        );
+      }
+    }
+
+    return generations.length > 0 ? generations : null;
+  }
+
+  async update(
+    prompt: string,
+    llmKey: string,
+    returnVal: Generation[]
+  ): Promise<void> {
+    const llmCache = await this.getLlmCache(llmKey);
+
+    const metadata = {
+      llm_string: llmKey,
+      prompt,
+      return_val: dumpGenerationsToJson(returnVal),
+    };
+    const document = new Document({
+      pageContent: prompt,
+      metadata,
+    });
+
+    await llmCache.addDocuments([document]);
   }
 }
