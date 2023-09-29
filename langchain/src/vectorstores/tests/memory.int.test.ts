@@ -66,7 +66,9 @@ describe("MemoryVectorStore", () => {
 
     // Add two to ensure it's not just returning the same generation.
     await semanticCache.update(initialPrompt, llmKey, [initialGeneration]);
-    await semanticCache.update("Is TypeScript better than Python?", llmKey, [initialCodeGeneration]);
+    await semanticCache.update("Is TypeScript better than Python?", llmKey, [
+      initialCodeGeneration,
+    ]);
 
     const results = await semanticCache.lookup(searchPrompt, llmKey);
     const codeResults = await semanticCache.lookup(codeSearchPrompt, llmKey);
